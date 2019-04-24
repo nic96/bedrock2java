@@ -1,3 +1,4 @@
+// transparent blocks
 const unsigned char tblocks[] = {
 	1,
 	0,

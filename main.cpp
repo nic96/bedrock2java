@@ -5,6 +5,7 @@
 #include <zlib.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <map>
 
 #include "leveldb/db.h"
 #include "leveldb/decompress_allocator.h"
@@ -14,6 +15,8 @@
 #include "tblock.h"
 #include "sblock.h"
 #include "alias.h"
+#include "vector3.h"
+#include "vector2.h"
 
 using namespace std;
 
@@ -248,9 +251,116 @@ int extractchunk(const void *data, int size, int y) {
 	return 0;
 }
 
+uint8_t nibble4(uint8_t arr[], int index) {
+    return index%2 == 0 ? arr[index/2]&0x0F : (arr[index/2]>>4)&0x0F;
+}
+
+map<Vector2, map<Vector3, int>> blocklights_to_update;
+
+void updatelight(int cnt, Vector2 curr_chunk) {
+	int ychunksize = sizeof(header_blocks) + 4096 + sizeof(header_data) + 2048 + sizeof(header_skylight) + 2048 + sizeof(header_blocklight) + 2048 + sizeof(footer);
+	if (!cnt)
+		return;
+
+	for (int xz = 0; xz < 256; xz++) {
+		int hide = 0;
+		for (int y = (cnt << 4) - 1; y >= 0; y--) {
+			unsigned char *b = wbuf + sizeof(header) + (y / 16) * ychunksize + sizeof(header_blocks);
+			unsigned char *l = b + 4096 + sizeof(header_data) + 2048 + sizeof(header_skylight);
+			int xx = xz | ((y & 0xF) << 8);
+			if (!hide && !tblocks[b[xx]])
+				hide = 1;
+			if (hide) {
+				if (!(xx & 1))
+					l[xx/2] = (l[xx/2] & 0xF0) | 0x0d;
+				else
+					l[xx/2] = (l[xx/2] & 0x0F) | 0xd0;
+			}
+		}
+	}
+
+	if(blocklights_to_update.find(curr_chunk) != blocklights_to_update.end()) {
+        for (auto it=blocklights_to_update[curr_chunk].begin(); it!=blocklights_to_update[curr_chunk].end(); ++it) {
+            uint8_t *blocklights = wbuf + sizeof(header) + (it->first.y / 16) * ychunksize + sizeof(header_blocks) + 4096 + sizeof(header_data) + 2048 + sizeof(header_skylight) + 2048 + sizeof(header_blocklight);
+            int block_pos = (it->first.y%16)*16*16 + it->first.z*16 + it->first.x;
+            if (block_pos%2 == 0)
+                blocklights[block_pos/2] = it->second + (blocklights[block_pos/2] & 0xF0);
+            else
+                blocklights[block_pos/2] = (it->second << 4) + (blocklights[block_pos/2] & 0x0F);
+        }
+        blocklights_to_update.erase(curr_chunk);
+    }
+
+    for (int x = 0; x < 16; x++) {
+        for (int y = 0; y < 256; y++) {
+            for (int z = 0; z < 16; z++) {
+                uint8_t *blocks = wbuf + sizeof(header) + (y / 16) * ychunksize + sizeof(header_blocks);
+                uint8_t *blocklights = blocks + 4096 + sizeof(header_data) + 2048 + sizeof(header_skylight) + 2048 + sizeof(header_blocklight);
+                int block_pos = (y%16)*16*16 + z*16 + x;
+                uint8_t block_id = blocks[block_pos];
+                if (block_id == 50) {
+                    int light_level = 14;
+                    // xd means x distance
+                    // yd means y disance
+                    // zd means z distance
+                    for (int xd = -light_level; xd <= light_level; xd++) {
+                        int height = (light_level - abs(xd)) * 2;
+                        for (int yd = -height / 2; yd <= (height/2); yd++) {
+                            int width = (light_level - abs(xd) - abs(yd)) * 2;
+                            for (int zd = -width / 2; zd <= (width/2); zd++) {
+                                int xc = x + xd;
+                                int yc = (y%16) + yd;
+                                int zc = z + zd;
+
+                                if (y + yd > 255 || y + yd < 0)
+                                    continue;
+
+                                if (xc < 0 || zc < 0 || xc > 15 || zc > 15) {
+                                    int chunkx = (xc < 0) ? (xc/16)-1 : xc/16;
+                                    chunkx += curr_chunk.x;
+                                    int chunkz = (zc < 0) ? (zc/16)-1 : zc/16;
+                                    chunkz += curr_chunk.y;
+                                    Vector3 block(xc%16, y, zc%16);
+                                    int curr_light_level = light_level - (abs(xd) + abs(yd) + abs(zd));
+                                    Vector2 chunk(chunkx, chunkz);
+                                    if(curr_light_level > blocklights_to_update[chunk][block]) {
+                                        blocklights_to_update[chunk][block] = curr_light_level;
+                                    }
+                                    continue;
+                                }
+
+                                block_pos = yc*16*16 + zc*16 + xc;
+                                if (block_pos>=4096) {
+                                    block_pos = block_pos - 4096;
+                                }
+                                block_id = blocks[block_pos];
+
+                                int blocklight = nibble4(blocklights, block_pos);
+                                if (blocklight >= light_level)
+                                    continue;
+
+                                int curr_light_level = light_level - (abs(xd) + abs(yd) + abs(zd));
+                                if (block_pos%2 == 0)
+                                    blocklights[block_pos/2] = curr_light_level + (blocklights[block_pos/2] & 0xF0);
+                                else
+                                    blocklights[block_pos/2] = (curr_light_level << 4) + (blocklights[block_pos/2] & 0x0F);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+//	printf("cnt=%d, wpos=%d\n", cnt, wpos);
+//	hexdump(wbuf,wpos);
+//	exit(0);
+}
+
 int writechunk(int x, int z) {
 	if (x == 0x7fffffff || z == 0x7fffffff)
 		return 0;
+
+    // fix chunk -1 -1
     int i, j;
     for (i = 0; i < wpos; i+=16) {
         for (j = 0; j < 16; j++) {
@@ -265,6 +375,7 @@ int writechunk(int x, int z) {
                         wbuf[i+j+5] = 0x01;
                         memcpy(wbuf + wpos, ender, sizeof(ender));
                         wpos += sizeof(ender);
+                        updatelight(1, Vector2(x, z));
                     }
                 }
             }
@@ -334,32 +445,6 @@ int writechunk(int x, int z) {
 	return 0;
 }
 
-void updatelight(int cnt) {
-	int ychunksize = sizeof(header_blocks) + 4096 + sizeof(header_data) + 2048 + sizeof(header_skylight) + 2048 + sizeof(header_blocklight) + 2048 + sizeof(footer);
-	if (!cnt)
-		return;
-
-	for (int xz = 0; xz < 256; xz++) {
-		int hide = 0;
-		for (int y = (cnt << 4) - 1; y >= 0; y--) {
-			unsigned char *b = wbuf + sizeof(header) + (y / 16) * ychunksize + sizeof(header_blocks);
-			unsigned char *l = b + 4096 + sizeof(header_data) + 2048 + sizeof(header_skylight);
-			int xx = xz | ((y & 0xF) << 8);
-			if (!hide && !tblocks[b[xx]])
-				hide = 1;
-			if (hide) {
-				if (!(xx & 1))
-					l[xx/2] = (l[xx/2] & 0xF0) | 0x0d;
-				else
-					l[xx/2] = (l[xx/2] & 0x0F) | 0xd0;
-			}
-		}
-	}
-//	printf("cnt=%d, wpos=%d\n", cnt, wpos);
-//	hexdump(wbuf,wpos);
-//	exit(0);
-}
-
 int main(int argc, char** argv)
 {
     // Set up database connection information and open database
@@ -418,7 +503,7 @@ int main(int argc, char** argv)
 			continue;
 
 		if (lx != x || lz != z) {
-			updatelight(cnt);
+			updatelight(cnt, Vector2(lx, lz));
 
 			memcpy(wbuf + wpos, ender, sizeof(ender));
 			wpos += sizeof(ender);
